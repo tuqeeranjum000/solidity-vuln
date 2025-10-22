@@ -42,10 +42,18 @@ export default async function handler(req, res) {
 
   const user = `INSTRUCTIONS:\n- Analyze the Solidity source code delimited below.\n- Return ONLY valid JSON, with a top-level object containing keys: metadata, vulnerabilities.\n- metadata should include: file_name (string), total_issues (integer).\n- vulnerabilities should be an array of objects; each object MUST contain the following fields:\n  - id: unique short id (string)\n  - type: short vulnerability name (string)\n  - severity: one of [low, medium, high, critical]\n  - description: short summary (string)\n  - detail: longer explanation (string)\n  - line: integer or null\n  - contract: contract name or null\n  - function: function name or null\n  - proof_of_concept: short code snippet or explanation (string or null)\n  - recommendation: actionable remediation steps (string)\n  - references: array of URLs or strings (may be empty)\n\nReturn a compact JSON object only (no markdown, no commentary). If any field is unknown, use null or an empty array/string as appropriate.\n\nEXAMPLE OUTPUT:\n{\n  "metadata": { "file_name": "MyContract.sol", "total_issues": 2 },\n  "vulnerabilities": [\n    { "id": "V001", "type": "Reentrancy", "severity": "critical", "description": "Reentrancy in withdraw()", "detail": "Detailed explanation...", "line": 123, "contract": "Vault", "function": "withdraw", "proof_of_concept": "call{value: ...}", "recommendation": "Use checks-effects-interactions...", "references": ["https://..."] }\n  ]\n}\n\nSTART_CONTRACT\n${content}\nEND_CONTRACT\n\nRespond only with the JSON object described above.`
 
+    // helper to call the LLM with a timeout so serverless platforms don't hang indefinitely
+    async function callWithTimeout(fn, ms = 25000) {
+      return await Promise.race([
+        fn(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('LLM request timed out')), ms)),
+      ])
+    }
+
     let text = ''
     try {
       try {
-        const resp = await openai.chat.completions.create({
+        const resp = await callWithTimeout(() => openai.chat.completions.create({
           model: 'qwen/qwen3-coder-480b-a35b-instruct',
           messages: [
             { role: 'system', content: system },
@@ -54,13 +62,14 @@ export default async function handler(req, res) {
           temperature: 0.0,
           max_tokens: 2000,
           top_p: 0.95,
-        })
+        }), 25000)
         text = resp.choices?.[0]?.message?.content || ''
       } catch (innerErr) {
-        console.warn('chat.completions failed, attempting Responses API fallback', innerErr?.message || innerErr)
+        // if chat.completions times out or errors, try the Responses API fallback
+        console.warn('chat.completions failed or timed out, attempting Responses API fallback', innerErr?.message || innerErr)
         if (openai.responses && typeof openai.responses.create === 'function'){
           try{
-            const resp2 = await openai.responses.create({
+            const resp2 = await callWithTimeout(() => openai.responses.create({
               model: 'qwen/qwen3-coder-480b-a35b-instruct',
               input: [
                 { role: 'system', content: system },
@@ -68,10 +77,10 @@ export default async function handler(req, res) {
               ],
               temperature: 0.0,
               max_output_tokens: 2000,
-            })
+            }), 30000)
             text = resp2.output_text || resp2.output?.[0]?.content?.find(c=>c.type==='output_text')?.text || ''
           }catch(innerErr2){
-            console.error('Responses API fallback also failed', innerErr2?.message || innerErr2)
+            console.error('Responses API fallback also failed or timed out', innerErr2?.message || innerErr2)
             throw innerErr2
           }
         } else {
@@ -80,9 +89,13 @@ export default async function handler(req, res) {
         }
       }
     } catch (err) {
-      console.error('LLM chat.completions failed', err?.message || err)
-      // If the LLM endpoint is unavailable (404/502), produce a conservative local fallback result
+      console.error('LLM chat.completions failed or timed out', err?.message || err)
+      // If the LLM endpoint is unavailable (404/502) or timed out, produce a conservative local fallback result
       const metadata = { file_name: file.originalFilename || 'contract.sol', total_issues: 0 }
+      // If the error indicates a timeout, return 504 so clients clearly see the gateway timeout
+      if (String(err).toLowerCase().includes('timed out') || String(err).toLowerCase().includes('timeout')){
+        return res.status(504).json({ metadata, vulnerabilities: [], fallback: true, rawError: String(err) })
+      }
       return res.status(200).json({ metadata, vulnerabilities: [], fallback: true, rawError: err?.message || String(err) })
     }
 
