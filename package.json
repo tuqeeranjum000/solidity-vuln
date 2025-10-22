@@ -10,8 +10,6 @@
   "dependencies": {
     "form-data": "^4.0.0",
     "formidable": "2.1.2",
-    "jspdf": "^3.0.3",
-    "jspdf-autotable": "^5.0.2",
     "next": "13.4.7",
     "openai": "4.7.0",
     "prismjs": "^1.29.0",
